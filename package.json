@@ -1,0 +1,12 @@
+{
+  "name": "soundstudio-backend",
+  "version": "1.0.0",
+  "description": "SoundStudio yt-dlp backend helper",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
