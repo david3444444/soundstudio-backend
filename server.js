@@ -142,6 +142,59 @@ async function resolveInvidiousFallback(query) {
   throw new Error('Failed to resolve stream URL via Invidious');
 }
 
+function runYtdlp(exePath, query, formatArgs, extraArgs = '') {
+  return new Promise((resolve, reject) => {
+    const cookiesPath = path.join(__dirname, 'cookies.txt');
+    if (fs.existsSync(cookiesPath)) {
+      const cmd = `"${exePath}" "ytsearch1:${query}" ${formatArgs} --cookies "${cookiesPath}" ${extraArgs}`;
+      console.log(`Running yt-dlp with cookies.txt: ${cmd}`);
+      exec(cmd, (err, stdout, stderr) => {
+        if (!err) return resolve(stdout.trim());
+        console.warn(`yt-dlp with cookies.txt failed: ${err.message}`);
+        tryNext();
+      });
+      return;
+    }
+    
+    tryNext();
+
+    function tryNext() {
+      if (process.platform === 'win32' || process.platform === 'darwin') {
+        const browsers = ['chrome', 'edge', 'firefox'];
+        let currentBrowserIdx = 0;
+        
+        function tryBrowser() {
+          if (currentBrowserIdx >= browsers.length) {
+            tryNoCookies();
+            return;
+          }
+          const browser = browsers[currentBrowserIdx++];
+          const cmd = `"${exePath}" "ytsearch1:${query}" ${formatArgs} --cookies-from-browser ${browser} ${extraArgs}`;
+          console.log(`Trying local browser cookies (${browser}): ${cmd}`);
+          exec(cmd, (err, stdout, stderr) => {
+            if (!err) return resolve(stdout.trim());
+            console.warn(`yt-dlp with browser ${browser} cookies failed: ${err.message}`);
+            tryBrowser();
+          });
+        }
+        
+        tryBrowser();
+      } else {
+        tryNoCookies();
+      }
+    }
+
+    function tryNoCookies() {
+      const cmd = `"${exePath}" "ytsearch1:${query}" ${formatArgs} ${extraArgs}`;
+      console.log(`Running yt-dlp without cookies: ${cmd}`);
+      exec(cmd, (err, stdout, stderr) => {
+        if (!err) return resolve(stdout.trim());
+        reject(err);
+      });
+    }
+  });
+}
+
 app.get('/resolve', async (req, res) => {
   const query = req.query.q;
   if (!query) {
@@ -152,27 +205,24 @@ app.get('/resolve', async (req, res) => {
     const exePath = await ensureYtdlp();
     console.log(`Resolving stream for query: "${query}"`);
 
-    const cmd = `"${exePath}" "ytsearch1:${query}" -f "ba" -g`;
-
-    exec(cmd, async (error, stdout, stderr) => {
-      if (error) {
-        console.warn(`yt-dlp failed on server, trying Invidious fallback: ${error.message}`);
-        try {
-          const streamUrl = await resolveInvidiousFallback(query);
-          console.log(`Resolved via Invidious fallback: ${streamUrl.substring(0, 60)}...`);
-          return res.json({ streamUrl });
-        } catch (fallbackErr) {
-          console.error(`Fallback also failed: ${fallbackErr.message}`);
-          return res.status(500).json({ error: 'Failed to resolve stream URL', details: error.message });
-        }
-      }
-      const streamUrl = stdout.trim();
+    try {
+      const streamUrl = await runYtdlp(exePath, query, '-f "ba" -g');
       if (!streamUrl) {
-        return res.status(404).json({ error: 'No stream URL found' });
+        throw new Error('No stream URL resolved by yt-dlp');
       }
       console.log(`Resolved: ${streamUrl.substring(0, 60)}...`);
-      res.json({ streamUrl });
-    });
+      return res.json({ streamUrl });
+    } catch (error) {
+      console.warn(`yt-dlp failed on server, trying Invidious fallback: ${error.message}`);
+      try {
+        const streamUrl = await resolveInvidiousFallback(query);
+        console.log(`Resolved via Invidious fallback: ${streamUrl.substring(0, 60)}...`);
+        return res.json({ streamUrl });
+      } catch (fallbackErr) {
+        console.error(`Fallback also failed: ${fallbackErr.message}`);
+        return res.status(500).json({ error: 'Failed to resolve stream URL', details: error.message });
+      }
+    }
   } catch (err) {
     console.error(`Failed to ensure yt-dlp: ${err}`);
     res.status(500).json({ error: 'Failed to initialize yt-dlp binary', details: err.message });
@@ -197,59 +247,55 @@ app.get('/download', async (req, res) => {
     const outputFilename = `${Date.now()}_${Math.random().toString(36).substring(7)}.mp3`;
     const outputPath = path.join(tempDir, outputFilename);
     
-    const cmd = `"${exePath}" "ytsearch1:${query}" -f "ba" -o "${outputPath}"`;
-    
-    console.log(`Executing: ${cmd}`);
-    exec(cmd, async (error, stdout, stderr) => {
-      if (error) {
-        console.warn(`yt-dlp download failed, trying Invidious download fallback: ${error.message}`);
-        try {
-          const streamUrl = await resolveInvidiousFallback(query);
-          console.log(`Downloading stream from fallback URL: ${streamUrl.substring(0, 60)}...`);
-          
-          const file = fs.createWriteStream(outputPath);
-          
-          function downloadStream(downloadUrl) {
-            const client = downloadUrl.startsWith('https') ? https : require('http');
-            client.get(downloadUrl, (response) => {
-              if (response.statusCode === 302 || response.statusCode === 301) {
-                downloadStream(response.headers.location);
-              } else if (response.statusCode === 200) {
-                response.pipe(file);
-                file.on('finish', () => {
-                  file.close();
-                  console.log(`Fallback download successful: ${outputPath}`);
-                  res.download(outputPath, `${query}.mp3`, (err) => {
-                    fs.unlink(outputPath, () => {});
-                  });
-                });
-              } else {
-                fs.unlink(outputPath, () => {});
-                res.status(500).json({ error: `Fallback download failed: Status code ${response.statusCode}` });
-              }
-            }).on('error', (err) => {
-              fs.unlink(outputPath, () => {});
-              res.status(500).json({ error: 'Fallback download failed', details: err.message });
-            });
-          }
-
-          downloadStream(streamUrl);
-          return;
-        } catch (fallbackErr) {
-          console.error(`Fallback download also failed: ${fallbackErr.message}`);
-          return res.status(500).json({ error: 'Failed to download audio stream', details: error.message });
-        }
-      }
+    try {
+      await runYtdlp(exePath, query, `-f "ba" -o "${outputPath}"`);
       
       if (!fs.existsSync(outputPath)) {
-        return res.status(404).json({ error: 'Output file was not created' });
+        throw new Error('Output file was not created');
       }
       
       console.log(`Sending file: ${outputPath}`);
-      res.download(outputPath, `${query}.mp3`, (err) => {
+      return res.download(outputPath, `${query}.mp3`, (err) => {
         fs.unlink(outputPath, () => {});
       });
-    });
+    } catch (error) {
+      console.warn(`yt-dlp download failed, trying Invidious download fallback: ${error.message}`);
+      try {
+        const streamUrl = await resolveInvidiousFallback(query);
+        console.log(`Downloading stream from fallback URL: ${streamUrl.substring(0, 60)}...`);
+        
+        const file = fs.createWriteStream(outputPath);
+        
+        function downloadStream(downloadUrl) {
+          const client = downloadUrl.startsWith('https') ? https : require('http');
+          client.get(downloadUrl, (response) => {
+            if (response.statusCode === 302 || response.statusCode === 301) {
+              downloadStream(response.headers.location);
+            } else if (response.statusCode === 200) {
+              response.pipe(file);
+              file.on('finish', () => {
+                file.close();
+                console.log(`Fallback download successful: ${outputPath}`);
+                res.download(outputPath, `${query}.mp3`, (err) => {
+                  fs.unlink(outputPath, () => {});
+                });
+              });
+            } else {
+              fs.unlink(outputPath, () => {});
+              res.status(500).json({ error: `Fallback download failed: Status code ${response.statusCode}` });
+            }
+          }).on('error', (err) => {
+            fs.unlink(outputPath, () => {});
+            res.status(500).json({ error: 'Fallback download failed', details: err.message });
+          });
+        }
+
+        downloadStream(streamUrl);
+      } catch (fallbackErr) {
+        console.error(`Fallback download also failed: ${fallbackErr.message}`);
+        return res.status(500).json({ error: 'Failed to download audio stream', details: error.message });
+      }
+    }
   } catch (err) {
     console.error(`Failed during download process: ${err}`);
     res.status(500).json({ error: 'Download initialization failed', details: err.message });
