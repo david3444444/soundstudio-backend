@@ -146,50 +146,30 @@ async function resolveInvidiousFallback(query) {
 function runYtdlp(exePath, videoUrl, formatArgs, extraArgs = '') {
   return new Promise((resolve, reject) => {
     const cookiesPath = path.join(__dirname, 'cookies.txt');
-    if (fs.existsSync(cookiesPath)) {
-      const cmd = `"${exePath}" "${videoUrl}" ${formatArgs} --cookies "${cookiesPath}" ${extraArgs}`;
-      console.log(`Running yt-dlp with cookies.txt: ${cmd}`);
-      exec(cmd, (err, stdout, stderr) => {
-        if (!err) return resolve(stdout.trim());
-        console.warn(`yt-dlp with cookies.txt failed: ${err.message}`);
-        tryNext();
-      });
-      return;
-    }
+    const hasCookies = fs.existsSync(cookiesPath);
     
-    tryNext();
-
-    function tryNext() {
-      if (process.platform === 'win32' || process.platform === 'darwin') {
-        const browsers = ['chrome', 'edge', 'firefox'];
-        let currentBrowserIdx = 0;
-        
-        function tryBrowser() {
-          if (currentBrowserIdx >= browsers.length) {
-            tryNoCookies();
-            return;
-          }
-          const browser = browsers[currentBrowserIdx++];
-          const cmd = `"${exePath}" "${videoUrl}" ${formatArgs} --cookies-from-browser ${browser} ${extraArgs}`;
-          console.log(`Trying local browser cookies (${browser}): ${cmd}`);
-          exec(cmd, (err, stdout, stderr) => {
-            if (!err) return resolve(stdout.trim());
-            console.warn(`yt-dlp with browser ${browser} cookies failed: ${err.message}`);
-            tryBrowser();
-          });
+    if (hasCookies) {
+      const cmd = `"${exePath}" "${videoUrl}" ${formatArgs} --cookies "./cookies.txt" ${extraArgs}`;
+      console.log(`Running yt-dlp with cookies: ${cmd}`);
+      exec(cmd, (err, stdout, stderr) => {
+        if (!err) {
+          return resolve(stdout.trim());
         }
-        
-        tryBrowser();
-      } else {
-        tryNoCookies();
-      }
+        console.warn(`yt-dlp with cookies failed: ${err.message}. Retrying without cookies...`);
+        runWithoutCookies();
+      });
+    } else {
+      console.warn(`cookies.txt not found at ${cookiesPath}. Attempting without cookies...`);
+      runWithoutCookies();
     }
 
-    function tryNoCookies() {
+    function runWithoutCookies() {
       const cmd = `"${exePath}" "${videoUrl}" ${formatArgs} ${extraArgs}`;
       console.log(`Running yt-dlp without cookies: ${cmd}`);
       exec(cmd, (err, stdout, stderr) => {
-        if (!err) return resolve(stdout.trim());
+        if (!err) {
+          return resolve(stdout.trim());
+        }
         reject(err);
       });
     }
