@@ -7,6 +7,10 @@ const https = require('https');
 const app = express();
 const port = process.env.PORT || 3000;
 
+app.get('/ping', (req, res) => {
+  res.json({ status: 'ok', message: 'SoundStudio backend is awake' });
+});
+
 const binDir = path.join(__dirname, 'bin');
 const ytdlpPath = path.join(binDir, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
 
