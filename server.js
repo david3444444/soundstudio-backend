@@ -61,6 +61,87 @@ function ensureYtdlp() {
   });
 }
 
+async function resolveInvidiousFallback(query) {
+  const instances = [
+    'https://invidious.projectsegfau.lt',
+    'https://yewtu.be',
+    'https://inv.tux.im',
+  ];
+  
+  let videoId = '';
+  
+  for (const instance of instances) {
+    try {
+      const searchUrl = `${instance}/api/v1/search?q=${encodeURIComponent(query)}&type=video`;
+      const response = await new Promise((resolve, reject) => {
+        https.get(searchUrl, (res) => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => {
+            try {
+              resolve(JSON.parse(data));
+            } catch (err) {
+              reject(err);
+            }
+          });
+        }).on('error', reject);
+      });
+      
+      if (response && response.length > 0) {
+        videoId = response[0].videoId;
+        if (videoId) break;
+      }
+    } catch (e) {
+      console.log(`Invidious search fallback failed on ${instance}: ${e.message}`);
+    }
+  }
+
+  if (!videoId) {
+    throw new Error('Failed to find video ID via Invidious');
+  }
+
+  for (const instance of instances) {
+    try {
+      const videoUrl = `${instance}/api/v1/videos/${videoId}`;
+      const data = await new Promise((resolve, reject) => {
+        https.get(videoUrl, (res) => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => {
+            try {
+              resolve(JSON.parse(data));
+            } catch (err) {
+              reject(err);
+            }
+          });
+        }).on('error', reject);
+      });
+
+      if (data && data.adaptiveFormats) {
+        let bestUrl = '';
+        let maxBitrate = 0;
+        for (const format of data.adaptiveFormats) {
+          const type = format.type || '';
+          if (type.startsWith('audio/')) {
+            const bitrate = parseInt(format.bitrate) || 0;
+            if (bitrate > maxBitrate) {
+              maxBitrate = bitrate;
+              bestUrl = format.url;
+            }
+          }
+        }
+        if (bestUrl) {
+          return bestUrl;
+        }
+      }
+    } catch (e) {
+      console.log(`Invidious stream fetch fallback failed on ${instance}: ${e.message}`);
+    }
+  }
+  
+  throw new Error('Failed to resolve stream URL via Invidious');
+}
+
 app.get('/resolve', async (req, res) => {
   const query = req.query.q;
   if (!query) {
@@ -73,10 +154,17 @@ app.get('/resolve', async (req, res) => {
 
     const cmd = `"${exePath}" "ytsearch1:${query}" -f "ba" -g`;
 
-    exec(cmd, (error, stdout, stderr) => {
+    exec(cmd, async (error, stdout, stderr) => {
       if (error) {
-        console.error(`Error executing yt-dlp: ${error.message}`);
-        return res.status(500).json({ error: 'Failed to resolve stream URL', details: error.message });
+        console.warn(`yt-dlp failed on server, trying Invidious fallback: ${error.message}`);
+        try {
+          const streamUrl = await resolveInvidiousFallback(query);
+          console.log(`Resolved via Invidious fallback: ${streamUrl.substring(0, 60)}...`);
+          return res.json({ streamUrl });
+        } catch (fallbackErr) {
+          console.error(`Fallback also failed: ${fallbackErr.message}`);
+          return res.status(500).json({ error: 'Failed to resolve stream URL', details: error.message });
+        }
       }
       const streamUrl = stdout.trim();
       if (!streamUrl) {
@@ -109,14 +197,48 @@ app.get('/download', async (req, res) => {
     const outputFilename = `${Date.now()}_${Math.random().toString(36).substring(7)}.mp3`;
     const outputPath = path.join(tempDir, outputFilename);
     
-    // Download best audio directly without requiring ffmpeg transcoding (works out of the box!)
     const cmd = `"${exePath}" "ytsearch1:${query}" -f "ba" -o "${outputPath}"`;
     
     console.log(`Executing: ${cmd}`);
-    exec(cmd, (error, stdout, stderr) => {
+    exec(cmd, async (error, stdout, stderr) => {
       if (error) {
-        console.error(`Error executing yt-dlp download: ${error.message}`);
-        return res.status(500).json({ error: 'Failed to download audio stream', details: error.message });
+        console.warn(`yt-dlp download failed, trying Invidious download fallback: ${error.message}`);
+        try {
+          const streamUrl = await resolveInvidiousFallback(query);
+          console.log(`Downloading stream from fallback URL: ${streamUrl.substring(0, 60)}...`);
+          
+          const file = fs.createWriteStream(outputPath);
+          
+          function downloadStream(downloadUrl) {
+            const client = downloadUrl.startsWith('https') ? https : require('http');
+            client.get(downloadUrl, (response) => {
+              if (response.statusCode === 302 || response.statusCode === 301) {
+                downloadStream(response.headers.location);
+              } else if (response.statusCode === 200) {
+                response.pipe(file);
+                file.on('finish', () => {
+                  file.close();
+                  console.log(`Fallback download successful: ${outputPath}`);
+                  res.download(outputPath, `${query}.mp3`, (err) => {
+                    fs.unlink(outputPath, () => {});
+                  });
+                });
+              } else {
+                fs.unlink(outputPath, () => {});
+                res.status(500).json({ error: `Fallback download failed: Status code ${response.statusCode}` });
+              }
+            }).on('error', (err) => {
+              fs.unlink(outputPath, () => {});
+              res.status(500).json({ error: 'Fallback download failed', details: err.message });
+            });
+          }
+
+          downloadStream(streamUrl);
+          return;
+        } catch (fallbackErr) {
+          console.error(`Fallback download also failed: ${fallbackErr.message}`);
+          return res.status(500).json({ error: 'Failed to download audio stream', details: error.message });
+        }
       }
       
       if (!fs.existsSync(outputPath)) {
@@ -125,7 +247,6 @@ app.get('/download', async (req, res) => {
       
       console.log(`Sending file: ${outputPath}`);
       res.download(outputPath, `${query}.mp3`, (err) => {
-        // Clean up temp file after sending
         fs.unlink(outputPath, () => {});
       });
     });
