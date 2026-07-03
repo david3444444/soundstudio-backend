@@ -3,6 +3,7 @@ const { exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const ytSearch = require('yt-search');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -142,11 +143,11 @@ async function resolveInvidiousFallback(query) {
   throw new Error('Failed to resolve stream URL via Invidious');
 }
 
-function runYtdlp(exePath, query, formatArgs, extraArgs = '') {
+function runYtdlp(exePath, videoUrl, formatArgs, extraArgs = '') {
   return new Promise((resolve, reject) => {
     const cookiesPath = path.join(__dirname, 'cookies.txt');
     if (fs.existsSync(cookiesPath)) {
-      const cmd = `"${exePath}" "ytsearch1:${query}" ${formatArgs} --cookies "${cookiesPath}" ${extraArgs}`;
+      const cmd = `"${exePath}" "${videoUrl}" ${formatArgs} --cookies "${cookiesPath}" ${extraArgs}`;
       console.log(`Running yt-dlp with cookies.txt: ${cmd}`);
       exec(cmd, (err, stdout, stderr) => {
         if (!err) return resolve(stdout.trim());
@@ -169,7 +170,7 @@ function runYtdlp(exePath, query, formatArgs, extraArgs = '') {
             return;
           }
           const browser = browsers[currentBrowserIdx++];
-          const cmd = `"${exePath}" "ytsearch1:${query}" ${formatArgs} --cookies-from-browser ${browser} ${extraArgs}`;
+          const cmd = `"${exePath}" "${videoUrl}" ${formatArgs} --cookies-from-browser ${browser} ${extraArgs}`;
           console.log(`Trying local browser cookies (${browser}): ${cmd}`);
           exec(cmd, (err, stdout, stderr) => {
             if (!err) return resolve(stdout.trim());
@@ -185,7 +186,7 @@ function runYtdlp(exePath, query, formatArgs, extraArgs = '') {
     }
 
     function tryNoCookies() {
-      const cmd = `"${exePath}" "ytsearch1:${query}" ${formatArgs} ${extraArgs}`;
+      const cmd = `"${exePath}" "${videoUrl}" ${formatArgs} ${extraArgs}`;
       console.log(`Running yt-dlp without cookies: ${cmd}`);
       exec(cmd, (err, stdout, stderr) => {
         if (!err) return resolve(stdout.trim());
@@ -202,30 +203,52 @@ app.get('/resolve', async (req, res) => {
   }
 
   try {
+    console.log(`Searching YouTube for: "${query}"`);
+    const searchResult = await ytSearch(query);
+    if (!searchResult || !searchResult.videos || searchResult.videos.length === 0) {
+      return res.status(404).json({ error: 'No video results found for the query' });
+    }
+
+    const video = searchResult.videos[0];
+    const videoId = video.videoId;
+    const title = video.title;
+    const thumbnail = video.thumbnail || video.image || '';
+    const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+
     const exePath = await ensureYtdlp();
-    console.log(`Resolving stream for query: "${query}"`);
+    console.log(`Resolving stream for video ID: ${videoId} (${title})`);
 
     try {
-      const streamUrl = await runYtdlp(exePath, query, '-f "ba" -g');
+      const streamUrl = await runYtdlp(exePath, videoUrl, '-f "ba" -g --js-runtimes node --force-ipv4');
       if (!streamUrl) {
         throw new Error('No stream URL resolved by yt-dlp');
       }
       console.log(`Resolved: ${streamUrl.substring(0, 60)}...`);
-      return res.json({ streamUrl });
+      return res.json({
+        title,
+        videoId,
+        thumbnail,
+        streamUrl
+      });
     } catch (error) {
       console.warn(`yt-dlp failed on server, trying Invidious fallback: ${error.message}`);
       try {
         const streamUrl = await resolveInvidiousFallback(query);
         console.log(`Resolved via Invidious fallback: ${streamUrl.substring(0, 60)}...`);
-        return res.json({ streamUrl });
+        return res.json({
+          title,
+          videoId,
+          thumbnail,
+          streamUrl
+        });
       } catch (fallbackErr) {
         console.error(`Fallback also failed: ${fallbackErr.message}`);
         return res.status(500).json({ error: 'Failed to resolve stream URL', details: error.message });
       }
     }
   } catch (err) {
-    console.error(`Failed to ensure yt-dlp: ${err}`);
-    res.status(500).json({ error: 'Failed to initialize yt-dlp binary', details: err.message });
+    console.error(`Error in /resolve route: ${err}`);
+    res.status(500).json({ error: 'Failed to resolve stream', details: err.message });
   }
 });
 
@@ -236,8 +259,19 @@ app.get('/download', async (req, res) => {
   }
 
   try {
+    console.log(`Searching YouTube for download: "${query}"`);
+    const searchResult = await ytSearch(query);
+    if (!searchResult || !searchResult.videos || searchResult.videos.length === 0) {
+      return res.status(404).json({ error: 'No video results found for the query' });
+    }
+
+    const video = searchResult.videos[0];
+    const videoId = video.videoId;
+    const title = video.title;
+    const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+
     const exePath = await ensureYtdlp();
-    console.log(`Downloading audio stream for query: "${query}"`);
+    console.log(`Downloading audio stream for video: ${videoUrl}`);
     
     const tempDir = path.join(__dirname, 'temp');
     if (!fs.existsSync(tempDir)) {
@@ -248,14 +282,14 @@ app.get('/download', async (req, res) => {
     const outputPath = path.join(tempDir, outputFilename);
     
     try {
-      await runYtdlp(exePath, query, `-f "ba" -o "${outputPath}"`);
+      await runYtdlp(exePath, videoUrl, `-f "ba" -o "${outputPath}" --js-runtimes node --force-ipv4`);
       
       if (!fs.existsSync(outputPath)) {
         throw new Error('Output file was not created');
       }
       
       console.log(`Sending file: ${outputPath}`);
-      return res.download(outputPath, `${query}.mp3`, (err) => {
+      return res.download(outputPath, `${title}.mp3`, (err) => {
         fs.unlink(outputPath, () => {});
       });
     } catch (error) {
@@ -276,7 +310,7 @@ app.get('/download', async (req, res) => {
               file.on('finish', () => {
                 file.close();
                 console.log(`Fallback download successful: ${outputPath}`);
-                res.download(outputPath, `${query}.mp3`, (err) => {
+                res.download(outputPath, `${title}.mp3`, (err) => {
                   fs.unlink(outputPath, () => {});
                 });
               });
